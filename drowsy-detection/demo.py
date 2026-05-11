@@ -1,1 +1,97 @@
+"""
+demo.py
+=======
+EyeExtractor 동작 확인용 데모 스크립트.
+
+웹캠을 열어 눈 랜드마크를 그리고, 추출된 눈 영역을 화면 우측에 표시합니다.
+
+실행:
+    python demo.py
+
+조작:
+    q : 종료
+    s : 현재 눈 영역 이미지를 파일로 저장 (테스트용)
+"""
+
+import cv2
+import numpy as np
+from eye_extractor import EyeExtractor, LEFT_EYE_INDICES, RIGHT_EYE_INDICES
+
+
+def draw_eye_landmarks(frame, eye_landmarks, color=(0, 255, 0)):
+    """눈 6개 좌표를 화면에 점과 선으로 그림."""
+    pts = eye_landmarks.astype(np.int32)
+    for (x, y) in pts:
+        cv2.circle(frame, (x, y), 2, color, -1)
+    # 6개 점을 닫힌 다각형으로 연결
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=1)
+
+
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] 웹캠을 열 수 없습니다.")
+        return
+
+    save_count = 0
+
+    # with 구문으로 자동 리소스 해제
+    with EyeExtractor(eye_image_size=64) as extractor:
+        print("데모 시작. 'q' 종료, 's' 눈 이미지 저장.")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 거울 모드 (좌우 반전, 사용자 직관 향상)
+            frame = cv2.flip(frame, 1)
+
+            # 핵심 호출: 눈 정보 추출
+            result = extractor.extract(frame)
+
+            if result is not None:
+                # 좌표 시각화
+                draw_eye_landmarks(frame, result.left_eye_landmarks, (0, 255, 0))
+                draw_eye_landmarks(frame, result.right_eye_landmarks, (0, 255, 0))
+
+                # 눈 영역 이미지를 화면 우측 상단에 미리보기로 표시
+                h, w = frame.shape[:2]
+                preview_size = 128
+                left_preview = cv2.resize(result.left_eye_image, (preview_size, preview_size))
+                right_preview = cv2.resize(result.right_eye_image, (preview_size, preview_size))
+                # 흑백 → BGR 변환 (화면에 합성하기 위해)
+                left_preview_bgr = cv2.cvtColor(left_preview, cv2.COLOR_GRAY2BGR)
+                right_preview_bgr = cv2.cvtColor(right_preview, cv2.COLOR_GRAY2BGR)
+
+                frame[10:10 + preview_size, w - preview_size - 10:w - 10] = left_preview_bgr
+                frame[20 + preview_size:20 + preview_size * 2, w - preview_size - 10:w - 10] = right_preview_bgr
+
+                cv2.putText(frame, "Left eye", (w - preview_size - 10, preview_size + 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, "Right eye", (w - preview_size - 10, preview_size * 2 + 42),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, "Face: OK", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, "Face: NOT DETECTED", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2.imshow("Eye Extractor Demo", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s') and result is not None:
+                cv2.imwrite(f"left_eye_{save_count:04d}.png", result.left_eye_image)
+                cv2.imwrite(f"right_eye_{save_count:04d}.png", result.right_eye_image)
+                print(f"저장됨: left_eye_{save_count:04d}.png, right_eye_{save_count:04d}.png")
+                save_count += 1
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
 
