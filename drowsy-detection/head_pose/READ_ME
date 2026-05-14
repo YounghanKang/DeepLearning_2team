@@ -1,1 +1,198 @@
+# Head Pose 추출 모듈
 
+웹캠 영상에서 운전자의 머리 자세(pitch, yaw, roll)를 추출하는 모듈입니다.
+EAR(눈 감김 감지)이 못 잡는 "고개 떨굼" 신호를 보완해 졸음 운전 탐지의 정확도를 향상시킵니다.
+
+## 파일 구성
+
+| 파일 | 역할 |
+|------|------|
+| `head_pose.py` | 핵심 모듈 (`HeadPoseEstimator` 클래스) |
+| `demo_head_pose.py` | 시각 데모 (각도 + 3D 축 시각화) |
+| `test_head_pose.py` | 자동 테스트 |
+
+## 환경
+
+`eye_extractor` 모듈과 동일합니다.
+
+- Python 3.11
+- mediapipe 0.10.9
+- opencv-python
+- numpy
+
+## 출력: 3가지 회전 각도
+
+| 각도 | 의미 | 졸음 관련 |
+|------|------|---------|
+| **pitch** | 위아래 (고개 끄덕임) | **+ 값 = 고개 떨굼 → 위험** |
+| **yaw** | 좌우 회전 (도리도리) | 큰 값 = 한눈팔이 |
+| **roll** | 좌우 기울임 | 큰 값 = 비스듬한 자세 |
+
+모든 값은 도(degree) 단위, -90 ~ +90 범위.
+
+## 빠른 시작
+
+### 시각 데모
+
+```bash
+python demo_head_pose.py
+```
+
+웹캠이 켜지면:
+- 화면 좌측 상단에 pitch/yaw/roll 수치 실시간 표시
+- 코끝에서 빨강(X) 초록(Y) 파랑(Z) 축이 뻗어나가며 머리 방향 시각화
+- pitch가 20도 이상 떨어지면 "HEAD DOWN" 빨강 경고
+
+확인할 동작:
+- 정면 응시 → 모든 각도가 0도 근처
+- 고개를 천천히 떨굼 → pitch가 양수로 증가, "HEAD DOWN" 표시
+- 좌우 회전 → yaw가 ±값으로 변화
+
+### 자동 테스트
+
+```bash
+python test_head_pose.py
+```
+
+처리 속도까지 측정합니다. M1 기준 평균 10ms 내외.
+
+## 사용법
+
+```python
+from head_pose import HeadPoseEstimator
+
+# 컨텍스트 매니저 사용 권장
+with HeadPoseEstimator() as estimator:
+    result = estimator.estimate(frame)
+
+    if result is None:
+        # 얼굴 미검출
+        continue
+
+    # 모델링 담당자에게 넘길 값들
+    pitch = result.pitch           # 위아래
+    yaw   = result.yaw             # 좌우 회전
+    roll  = result.roll            # 좌우 기울임
+    conf  = result.confidence      # 추정 신뢰도 (0~1)
+```
+
+## 출력 구조: `HeadPoseResult`
+
+| 필드 | 타입 | 의미 | 누가 쓰나 |
+|------|------|------|----------|
+| `pitch` | float | 위아래 각도 (도) | **모델링: 졸음 판단의 핵심** |
+| `yaw` | float | 좌우 회전 (도) | 모델링: 한눈팔이 감지 |
+| `roll` | float | 좌우 기울임 (도) | 모델링: 자세 평가 |
+| `confidence` | float | 신뢰도 (0~1) | **모델링: 낮은 값 필터링** |
+| `face_detected` | bool | 얼굴 검출 여부 | 디버깅 |
+
+### 신뢰도(confidence) 활용 가이드
+
+측면을 보거나 극단적 자세에서는 추정 정확도가 떨어집니다. 모델링 담당자가 신뢰도를 활용해 필터링하면 거짓 양성을 줄일 수 있어요.
+
+```python
+# 예시: 신뢰도 0.5 미만은 무시
+if result.confidence < 0.5:
+    continue  # 이 프레임은 사용 안 함
+```
+
+## EyeExtractor와 함께 사용
+
+두 모듈을 병렬로 호출:
+
+```python
+from eye_extractor import EyeExtractor
+from head_pose import HeadPoseEstimator
+
+with EyeExtractor() as eye_ext, HeadPoseEstimator() as head_est:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # 두 정보를 한 번에 추출
+        eye_data = eye_ext.extract(frame)
+        head_data = head_est.estimate(frame)
+
+        if eye_data is None or head_data is None:
+            continue
+
+        # 모델링 담당자에게 전달
+        # - eye_data.left_eye_landmarks    : EAR 계산용
+        # - eye_data.left_eye_image        : CNN 입력용
+        # - head_data.pitch                : 졸음 보조 신호
+```
+
+**주의:** 두 모듈은 각자 MediaPipe Face Mesh를 호출하므로 처리 시간이 2배가 됩니다. 성능이 문제되면 회의에서 통합 모듈(`FaceExtractor`)을 만들지 논의하세요.
+
+## 모델링 담당자를 위한 가이드
+
+### pitch 기반 졸음 판단 예시
+
+```python
+PITCH_DOWN_THRESHOLD = 20.0  # 도(degree)
+
+if head_data.pitch >= PITCH_DOWN_THRESHOLD:
+    head_down_count += 1   # PERCLOS와 유사한 방식
+```
+
+이 임계값은 회의에서 협의하세요. 사람마다 평소 자세가 다르므로 EAR과 마찬가지로 **개인 baseline 측정**을 고려할 수 있습니다.
+
+### 신호 융합 권장 시작점
+
+가장 단순한 OR 방식:
+
+```python
+if eye_closed or head_down:
+    danger_score += 1
+```
+
+PERCLOS와 합치면:
+
+```python
+# 두 신호 각각 PERCLOS 계산
+eye_perclos = ear_perclos_calculator.update(eye_closed)
+head_perclos = head_perclos_calculator.update(head_down)
+
+# 종합 점수
+total_score = max(eye_perclos, head_perclos)
+```
+
+## 원리 간단 설명
+
+1. **MediaPipe Face Mesh**로 얼굴 6개 점의 2D 좌표 추출 (코끝, 턱, 눈가, 입꼬리)
+2. **3D 표준 얼굴 모델**(평균적인 사람 얼굴)의 같은 6개 점 3D 좌표 준비
+3. **OpenCV solvePnP**: 2D-3D 매칭으로 카메라 기준 회전 행렬 추정
+4. **회전 행렬 → 오일러 각도** 변환으로 pitch/yaw/roll 산출
+
+수학을 직접 구현할 필요 없이 OpenCV 함수 호출만으로 완성됩니다.
+
+## 알려진 한계
+
+| 한계 | 영향 | 대응 |
+|------|------|------|
+| 측면 응시 시 정확도 ↓ | yaw 30도 이상에서 pitch 오차 | confidence 필터링 |
+| 카메라 보정값 없음 | 약간의 절대 오차 | 상대 변화 위주로 사용 |
+| 안경·마스크 영향 | 일부 랜드마크 가림 가능 | MediaPipe가 어느 정도 보정 |
+| 개인 차이 | 평소 자세가 사람마다 다름 | baseline 측정 추가 (선택) |
+
+## 다음 단계 인터페이스
+
+이 모듈의 출력은 모델링 담당자가 다음과 같이 사용합니다.
+
+```
+[HeadPoseEstimator] → pitch, yaw, roll, confidence
+                          ↓
+                  [모델링 측 판단 로직]
+                          ↓
+                  PERCLOS / 신호 융합
+```
+
+**약속**: `HeadPoseResult` 인터페이스는 한 달 동안 유지됩니다.
+
+## 테스트 환경
+
+- macOS Sonoma (Apple Silicon M1)
+- Python 3.11
+- mediapipe 0.10.9
+- 평균 처리 속도: 10ms (M1 기준)
