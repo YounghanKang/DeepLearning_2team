@@ -22,12 +22,14 @@ feature_extractor.py
             label=1,
         )
 """
+# feature_extract/feature_extractor.py 맨 위에 이걸 넣어주세요!
 
+# ... 이 아래로 원석이가 원래 짰던 import cv2 등이 쭉 이어지면 됩니다 ...
+import mediapipe as mp
 import os
 import cv2
 import csv
 import numpy as np
-import mediapipe as mp
 from typing import Optional
 from pathlib import Path
 

@@ -1,0 +1,8 @@
+# .gitignore
+.venv/
+__pycache__/
+.DS_Store
+
+# 대용량 데이터 및 가중치 파일 제외
+data/rldd_features.csv
+models/best_lstm_model.pth
