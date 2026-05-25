@@ -4,8 +4,33 @@ import mediapipe as mp
 import numpy as np
 import time
 import math
+import sys
+import os
+from pathlib import Path
 from collections import deque
 from datetime import datetime
+
+# ── 팀 모듈 import ──────────────────────────────────────────────
+# Dashboard/ 폴더 → 프로젝트 루트로 경로 추가
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+try:
+    import torch
+    from feature_extract.feature_extractor import FeatureExtractor
+    from model import DrowsyLSTM
+    TEAM_MODULES_AVAILABLE = True
+except Exception as e:
+    print(f"[경고] 팀 모듈 로드 실패: {e}")
+    TEAM_MODULES_AVAILABLE = False
+
+# BiLSTM은 선택적 — 모델 담당이 model.py에 추가하기 전까지는 없을 수 있음.
+# 없어도 LSTM 모드는 정상 동작하도록 분리해서 import.
+try:
+    from model import DrowsyBiLSTM
+    BILSTM_AVAILABLE = True
+except Exception:
+    BILSTM_AVAILABLE = False
 
 # ── Page config ─────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -260,7 +285,7 @@ div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] button {
 </style>
 """, unsafe_allow_html=True)
 
-# ── MediaPipe ────────────────────────────────────────────────────────────────────
+# ── MediaPipe (시각화용 랜드마크 표시에만 사용) ─────────────────────────────────
 mp_face_mesh = mp.solutions.face_mesh
 
 LEFT_EYE  = [362, 385, 387, 263, 373, 380]
@@ -281,7 +306,81 @@ def calc_perclos(ear_buf):
     return sum(1 for e in ear_buf if e < 0.21) / len(ear_buf)
 
 def perclos_to_score(perclos):
+    """LSTM 모델 미사용 시 폴백용 — 단순 EAR 규칙."""
     return min(100.0, perclos * 250)
+
+
+# ── LSTM 추론 관련 ──────────────────────────────────────────────────────────────
+WINDOW_SIZE   = 30   # train.py / dataset.py와 동일
+LSTM_CLASSES  = 3    # NORMAL / WARNING / DANGER
+
+# LSTM 3클래스 → 0~100 점수 매핑 가중치
+# softmax 확률에 가중치를 곱해 부드러운 점수 산출
+CLASS_SCORE_WEIGHTS = np.array([0.0, 50.0, 100.0], dtype=np.float32)
+
+
+@st.cache_resource
+def load_lstm_model(model_type: str = "lstm"):
+    """
+    학습된 LSTM/BiLSTM 가중치를 로드.
+
+    Args:
+        model_type: "lstm" 또는 "bilstm"
+    Returns:
+        (model, device) 또는 (None, None) — 로드 실패 시
+    """
+    if not TEAM_MODULES_AVAILABLE:
+        return None, None
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+    # BiLSTM 요청인데 모델 클래스가 없으면(모델 담당 미반영) LSTM으로 자동 폴백
+    if model_type == "bilstm" and BILSTM_AVAILABLE:
+        weight_path = ROOT / "models" / "best_bilstm_model.pth"
+        model = DrowsyBiLSTM(input_dim=4, hidden_dim=64, num_layers=2, num_classes=3)
+    else:
+        weight_path = ROOT / "models" / "best_lstm_model.pth"
+        model = DrowsyLSTM(input_dim=4, hidden_dim=64, num_layers=2, num_classes=3)
+
+    if not weight_path.exists():
+        print(f"[경고] 가중치 없음: {weight_path}")
+        return None, None
+
+    try:
+        model.load_state_dict(torch.load(weight_path, map_location=device))
+        model.to(device).eval()
+        return model, device
+    except Exception as e:
+        print(f"[경고] 모델 로드 실패: {e}")
+        return None, None
+
+
+@st.cache_resource
+def load_feature_extractor():
+    """장원석 팀원의 통합 추출기 (MediaPipe + EAR + Head Pose 한 번에)."""
+    if not TEAM_MODULES_AVAILABLE:
+        return None
+    return FeatureExtractor()
+
+
+def predict_with_lstm(model, device, frame_window: deque) -> tuple:
+    """
+    30프레임 시퀀스를 LSTM에 넣어 졸음 점수와 클래스 예측.
+
+    Returns:
+        (score 0~100, pred_class 0/1/2, probs np.array)
+    """
+    arr = np.array(list(frame_window), dtype=np.float32)   # (30, 4)
+    tensor = torch.from_numpy(arr).unsqueeze(0).to(device) # (1, 30, 4)
+
+    with torch.no_grad():
+        logits = model(tensor)
+        probs  = torch.softmax(logits, dim=1).cpu().numpy()[0]  # (3,)
+        pred   = int(np.argmax(probs))
+
+    # softmax 확률 가중합으로 0~100 점수 계산
+    score = float(np.dot(probs, CLASS_SCORE_WEIGHTS))
+    return score, pred, probs
 
 # ── Stage config ──────────────────────────────────────────────────────────────────
 STAGE_CFG = [
@@ -306,6 +405,7 @@ def init_state():
         "running": False,
         "score": 0.0,
         "ear_buffer": deque(maxlen=150),
+        "feature_window": deque(maxlen=WINDOW_SIZE),  # LSTM 입력용 30프레임 버퍼
         "log_entries": [],
         "thresholds": [0, 20, 40, 60, 80, 100],
         "last_log_time": 0,
@@ -314,12 +414,21 @@ def init_state():
         "stage_start_time": None,
         "auto_called": False,
         "cap": None,
+        # 기본은 LSTM (어디서든 보장). BiLSTM은 모델 담당 반영 후 선택 가능.
+        "model_type": "bilstm" if BILSTM_AVAILABLE else "lstm",
+        "last_pred_class": 0,         # 마지막 LSTM 예측 클래스
+        "last_probs": None,           # 마지막 LSTM 확률 분포
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 init_state()
+
+# 모델/추출기 로드 (캐시되어 한 번만 실행됨)
+lstm_model, lstm_device = load_lstm_model(st.session_state["model_type"])
+feature_extractor       = load_feature_extractor()
+LSTM_READY = lstm_model is not None and feature_extractor is not None
 
 # ── Helpers ───────────────────────────────────────────────────────────────────────
 def adapt_thresholds(log_entries):
@@ -550,7 +659,31 @@ with col_mid:
             unsafe_allow_html=True,
         )
     with header_right:
-        empty_col, real_btn_col = st.columns([1.2, 3])
+        model_col, real_btn_col = st.columns([1.5, 3])
+
+        with model_col:
+            # LSTM ↔ BiLSTM 모델 선택
+            # BiLSTM은 모델 담당이 model.py에 반영한 경우에만 옵션으로 노출
+            model_options = ["lstm"]
+            if BILSTM_AVAILABLE:
+                model_options = ["bilstm", "lstm"]
+
+            cur = st.session_state["model_type"]
+            cur_index = model_options.index(cur) if cur in model_options else 0
+
+            model_choice = st.selectbox(
+                "모델",
+                options=model_options,
+                index=cur_index,
+                key="model_select",
+                label_visibility="collapsed",
+            )
+            if model_choice != st.session_state["model_type"]:
+                st.session_state["model_type"] = model_choice
+                st.session_state["feature_window"] = deque(maxlen=WINDOW_SIZE)
+                add_activity(f"🔄 모델 전환 → {model_choice.upper()}")
+                st.rerun()
+
         with real_btn_col:
             is_webcam_running = st.session_state["running"]
 
@@ -558,9 +691,10 @@ with col_mid:
 
             if st.button(btn_label, key="toggle"):
                 if not is_webcam_running:
-                    st.session_state["running"]       = True
-                    st.session_state["ear_buffer"]    = deque(maxlen=150)
-                    st.session_state["auto_called"]   = False
+                    st.session_state["running"]        = True
+                    st.session_state["ear_buffer"]     = deque(maxlen=150)
+                    st.session_state["feature_window"] = deque(maxlen=WINDOW_SIZE)
+                    st.session_state["auto_called"]    = False
                     add_activity("웹캠 모니터링 시작")
 
                 else:
@@ -675,6 +809,19 @@ def update_ui(score, thresholds, prev_score, frame=None):
 # ═══════════════════════════════════════════════════════════════
 # WEBCAM LOOP
 # ═══════════════════════════════════════════════════════════════
+#
+# 통합된 파이프라인:
+#   웹캠 프레임
+#     ├─ feature_extractor.extract_from_frame()  ← 장원석 모듈
+#     │     → (ear, pitch, yaw, roll)
+#     │
+#     ├─ 30프레임 슬라이딩 윈도우 누적
+#     │
+#     └─ LSTM/BiLSTM 추론  ← 강영한 모듈
+#           → 클래스 확률 → 0~100 점수
+#
+# 모델 로드 실패 시: 기존 EAR-PERCLOS 규칙 폴백
+# ═══════════════════════════════════════════════════════════════
 if st.session_state["running"]:
     cap_obj = st.session_state.get("cap")
     if cap_obj is None or not cap_obj.isOpened():
@@ -684,12 +831,19 @@ if st.session_state["running"]:
         cap_obj.set(cv2.CAP_PROP_FPS, 30)
         st.session_state["cap"] = cap_obj
 
+    # 시각화용 MediaPipe (눈 랜드마크 표시만 담당)
     face_mesh = mp_face_mesh.FaceMesh(
         max_num_faces=1,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
+
+    # 모드 안내
+    if LSTM_READY:
+        add_activity(f"🧠 LSTM 모델 활성화 ({st.session_state['model_type'].upper()})")
+    else:
+        add_activity("⚠ LSTM 모델 미사용 — EAR 규칙 폴백 모드")
 
     frame_count = 0
     while st.session_state["running"]:
@@ -698,30 +852,77 @@ if st.session_state["running"]:
             add_activity("⚠ 카메라 읽기 실패")
             break
 
-        frame  = cv2.flip(frame, 1)
+        frame = cv2.flip(frame, 1)
+
+        # ─────────────────────────────────────────────────────
+        # 1) 특징 추출 — 팀원 모듈 사용
+        # ─────────────────────────────────────────────────────
+        ear_val  = None
+        features = None
+
+        if LSTM_READY:
+            features = feature_extractor.extract_from_frame(frame)
+            if features is not None:
+                ear_val = features["ear"]
+                # LSTM 입력 윈도우에 누적
+                st.session_state["feature_window"].append([
+                    features["ear"],
+                    features["pitch"],
+                    features["yaw"],
+                    features["roll"],
+                ])
+                st.session_state["ear_buffer"].append(features["ear"])
+
+        # ─────────────────────────────────────────────────────
+        # 2) 눈 랜드마크 시각화 (별도 MediaPipe 호출)
+        #    추출기와 중복 호출이지만 UI 표시용으로만 사용
+        # ─────────────────────────────────────────────────────
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = face_mesh.process(rgb)
-
-        ear_val = None
         if result.multi_face_landmarks:
             lm = result.multi_face_landmarks[0].landmark
-            ear_l   = calc_ear(lm, LEFT_EYE)
-            ear_r   = calc_ear(lm, RIGHT_EYE)
-            ear_val = (ear_l + ear_r) / 2.0
-            st.session_state["ear_buffer"].append(ear_val)
+            if ear_val is None:
+                # 폴백 경로: 추출기를 못 쓰면 직접 EAR 계산
+                ear_l   = calc_ear(lm, LEFT_EYE)
+                ear_r   = calc_ear(lm, RIGHT_EYE)
+                ear_val = (ear_l + ear_r) / 2.0
+                st.session_state["ear_buffer"].append(ear_val)
+
             h, w = frame.shape[:2]
             for idx in LEFT_EYE + RIGHT_EYE:
                 cx = int(lm[idx].x * w)
                 cy = int(lm[idx].y * h)
                 cv2.circle(frame, (cx, cy), 2, (37, 99, 235), -1)
 
+        # ─────────────────────────────────────────────────────
+        # 3) 점수 계산: LSTM 우선, 실패 시 EAR 규칙 폴백
+        # ─────────────────────────────────────────────────────
         perclos    = calc_perclos(st.session_state["ear_buffer"])
-        raw_score  = perclos_to_score(perclos)
         prev_score = st.session_state["score"]
+
+        used_lstm = False
+        pred_class = st.session_state["last_pred_class"]
+        probs      = st.session_state["last_probs"]
+
+        if LSTM_READY and len(st.session_state["feature_window"]) == WINDOW_SIZE:
+            raw_score, pred_class, probs = predict_with_lstm(
+                lstm_model, lstm_device, st.session_state["feature_window"]
+            )
+            used_lstm = True
+            st.session_state["last_pred_class"] = pred_class
+            st.session_state["last_probs"]      = probs
+        else:
+            # LSTM 미사용 또는 30프레임 미달 → EAR-PERCLOS 규칙
+            raw_score = perclos_to_score(perclos)
+
+        # 지수 평활화 (UI 흔들림 방지)
         st.session_state["score"] = 0.85 * prev_score + 0.15 * raw_score
         score      = st.session_state["score"]
         thresholds = st.session_state["thresholds"]
 
+        # ─────────────────────────────────────────────────────
+        # 4) 영상 오버레이
+        # ─────────────────────────────────────────────────────
         stage = score_to_stage(score, thresholds)
         cfg   = STAGE_CFG[stage]
         color_rgb = tuple(int(cfg["color"].lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
@@ -731,10 +932,20 @@ if st.session_state["running"]:
                       color_bgr, 2 if stage < 3 else 4)
 
         ear_txt = f"EAR: {ear_val:.3f}" if ear_val else "EAR: --"
-        cv2.putText(frame, ear_txt,                    (12, 28),  cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"PERCLOS: {perclos*100:.1f}%", (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"SCORE: {score:.1f}",      (12, 78),  cv2.FONT_HERSHEY_SIMPLEX, 0.70, color_bgr, 2, cv2.LINE_AA)
-        cv2.putText(frame, f"STAGE: {stage}", (12, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.70, color_bgr, 2, cv2.LINE_AA)
+        cv2.putText(frame, ear_txt,                          (12, 28),  cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"PERCLOS: {perclos*100:.1f}%",   (12, 52),  cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"SCORE: {score:.1f}",            (12, 78),  cv2.FONT_HERSHEY_SIMPLEX, 0.70, color_bgr, 2, cv2.LINE_AA)
+        cv2.putText(frame, f"STAGE: {stage}",                (12, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.70, color_bgr, 2, cv2.LINE_AA)
+
+        # 모델 추론 정보
+        if used_lstm and probs is not None:
+            mode_txt = f"{st.session_state['model_type'].upper()} | N={probs[0]:.2f} W={probs[1]:.2f} D={probs[2]:.2f}"
+        elif LSTM_READY:
+            need = WINDOW_SIZE - len(st.session_state["feature_window"])
+            mode_txt = f"LSTM warming up ({need} frames left)"
+        else:
+            mode_txt = "EAR fallback (LSTM unavailable)"
+        cv2.putText(frame, mode_txt, (12, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
         if stage >= 3 and frame_count % 15 < 8:
             cv2.rectangle(frame, (3, 3), (frame.shape[1]-3, frame.shape[0]-3), (220, 38, 38), 3)
