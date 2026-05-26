@@ -748,7 +748,7 @@ with col_right:
 # ═══════════════════════════════════════════════════════════════
 # SHARED UI UPDATE FUNCTION
 # ═══════════════════════════════════════════════════════════════
-LOG_INTERVAL = 3
+LOG_INTERVAL = 1
 
 def update_ui(score, thresholds, prev_score, frame=None):
     stage      = score_to_stage(score, thresholds)
