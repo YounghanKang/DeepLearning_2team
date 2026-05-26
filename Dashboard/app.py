@@ -627,7 +627,7 @@ with col_left:
 # MIDDLE — Video frame + Gauge
 # ═══════════════════════════════════════
 with col_mid:
-    header_left, header_right = st.columns([5.5, 1.5])
+    header_left, header_right = st.columns([4, 1.5])
 
     with header_left:
         rec_html = ""
@@ -659,7 +659,7 @@ with col_mid:
             unsafe_allow_html=True,
         )
     with header_right:
-        model_col, real_btn_col = st.columns([1.5, 3])
+        model_col, real_btn_col = st.columns([3.3, 5])
 
         with model_col:
             # LSTM ↔ BiLSTM 모델 선택
@@ -774,8 +774,18 @@ def update_ui(score, thresholds, prev_score, frame=None):
             4: "🚨 긴급 단계! (경보 울림) — 즉시 정차하세요!",
         }
         add_activity(msgs.get(stage, ""))
+        
+        if stage == 1:
+            st.toast("주의 단계 — 상태를 확인하세요.", icon="📢")
+        elif stage == 2:
+            st.toast("경고 단계 — 졸음이 감지되었습니다. 잠시 환기하세요.", icon="⚠️")
+        elif stage == 3:
+            st.toast("위험 단계 — 즉시 휴식을 취하세요!", icon="🔴")
+        
         if stage >= 3:
             st.session_state["stage_start_time"] = time.time()
+        
+        
 
     # auto 119 call
     if stage == 4 and not st.session_state["auto_called"]:
