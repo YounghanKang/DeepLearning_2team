@@ -1,12 +1,17 @@
-# .gitignore
-.venv/
+# Datasets (Large CSV files)
+*.csv
+*.task
+
+# Model weights
+*.pth
+*.h5
+*.pt
+
+# Weights & Biases logs and media
+**/wandb/
+
+# Python cache & virtual environments
 __pycache__/
-.DS_Store
-
-# 대용량 데이터 및 가중치 파일 제외
-data/rldd_features.csv
-# 학습 결과물(.pth)은 각자 학습하므로 git에서 제외
-models/
-
-# 로그 파일
-*_log.txt
+*.pyc
+venv/
+.venv/
