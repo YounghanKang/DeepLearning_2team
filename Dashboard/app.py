@@ -24,12 +24,39 @@ except Exception as e:
     print(f"[경고] 팀 모듈 로드 실패: {e}")
     TEAM_MODULES_AVAILABLE = False
 
-# BiLSTM은 선택적 — 모델 담당이 model.py에 추가하기 전까지는 없을 수 있음.
-# 없어도 LSTM 모드는 정상 동작하도록 분리해서 import.
+# BiLSTM은 indivi/ 폴더에 분리되어 있음.
+# 모델 클래스 이름: DrowsinessBiLSTM (DrowsyBiLSTM 아님).
+# 입력은 StandardScaler 정규화된 (ear, pitch, yaw, roll) 시퀀스.
+#
+# train_bilstm.py 가 wandb/tqdm/seaborn 등 학습 전용 라이브러리를 top-level에서
+# import 하므로 직접 import 불가. 대신 indivi/infer_bilstm.py 의 자체 복제 패턴
+# 그대로 모델 클래스를 인라인 정의 (해당 파일 주석: "train_bilstm.py와 동일").
 try:
-    from model import DrowsyBiLSTM
+    from sklearn.preprocessing import StandardScaler
+    import pandas as pd
+    import torch.nn as _nn
+
+    class DrowsinessBiLSTM(_nn.Module):
+        """indivi/train_bilstm.py 의 클래스와 1:1 동일 (가중치 호환)."""
+        def __init__(self, input_size=4, hidden_size=64, num_layers=2, num_classes=3):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.num_layers = num_layers
+            self.lstm = _nn.LSTM(
+                input_size, hidden_size, num_layers,
+                batch_first=True, bidirectional=True,
+            )
+            self.fc = _nn.Linear(hidden_size * 2, num_classes)
+
+        def forward(self, x):
+            h0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
+            c0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
+            out, _ = self.lstm(x, (h0, c0))
+            return self.fc(out[:, -1, :])
+
     BILSTM_AVAILABLE = True
-except Exception:
+except Exception as e:
+    print(f"[경고] BiLSTM 모듈 로드 실패: {e}")
     BILSTM_AVAILABLE = False
 
 # ── Page config ─────────────────────────────────────────────────────────────────
@@ -319,8 +346,53 @@ LSTM_CLASSES  = 3    # NORMAL / WARNING / DANGER
 CLASS_SCORE_WEIGHTS = np.array([0.0, 50.0, 100.0], dtype=np.float32)
 
 
+# BiLSTM 가중치/CSV 후보 경로
+# 모델 담당이 학습 결과를 어디 두느냐에 따라 두 위치를 모두 확인.
+BILSTM_WEIGHT_CANDIDATES = [
+    ROOT / "indivi" / "bilstm_drowsiness_model.pth",  # train_bilstm.py 기본 저장 경로
+    ROOT / "models" / "best_bilstm_model.pth",        # 예비 경로
+]
+CSV_CANDIDATES = [
+    ROOT / "data" / "rldd_features.csv",   # 우리 표준 위치
+    ROOT / "indivi" / "rldd_features.csv", # indivi 스크립트가 기대하는 위치
+]
+
+
 @st.cache_resource
-def load_lstm_model(model_type: str = "lstm"):
+def load_bilstm_scaler():
+    """
+    BiLSTM 학습 시 사용한 StandardScaler를 CSV로부터 재구성.
+
+    infer_bilstm.py와 동일한 방식: 학습용 CSV의 (ear,pitch,yaw,roll) 통계로 fit.
+    캐시되어 startup 시 1회만 실행됨 (~3초).
+
+    Returns:
+        StandardScaler 또는 None — CSV 미발견 / 라이브러리 없음 시
+    """
+    if not BILSTM_AVAILABLE:
+        return None
+
+    csv_path = next((p for p in CSV_CANDIDATES if p.exists()), None)
+    if csv_path is None:
+        print(f"[경고] BiLSTM 스케일러용 CSV 없음. 확인 경로: {CSV_CANDIDATES}")
+        return None
+
+    try:
+        # 4개 컬럼만 읽어 메모리/속도 절약
+        df = pd.read_csv(csv_path, usecols=["ear", "pitch", "yaw", "roll"])
+        # 결측치(-1)는 학습 시와 동일하게 NaN→직전값 처리
+        df = df.replace(-1, np.nan).ffill().fillna(0)
+        scaler = StandardScaler()
+        scaler.fit(df[["ear", "pitch", "yaw", "roll"]].values)
+        print(f"[정보] BiLSTM 스케일러 fit 완료 ({csv_path.name})")
+        return scaler
+    except Exception as e:
+        print(f"[경고] 스케일러 fit 실패: {e}")
+        return None
+
+
+@st.cache_resource
+def load_lstm_model(model_type: str = "bilstm"):
     """
     학습된 LSTM/BiLSTM 가중치를 로드.
 
@@ -334,21 +406,25 @@ def load_lstm_model(model_type: str = "lstm"):
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-    # BiLSTM 요청인데 모델 클래스가 없으면(모델 담당 미반영) LSTM으로 자동 폴백
     if model_type == "bilstm" and BILSTM_AVAILABLE:
-        weight_path = ROOT / "models" / "best_bilstm_model.pth"
-        model = DrowsyBiLSTM(input_dim=4, hidden_dim=64, num_layers=2, num_classes=3)
+        # indivi/train_bilstm.py 의 DrowsinessBiLSTM 사용
+        # (input=4, hidden=64, layers=2, classes=3 — 학습 스크립트와 동일)
+        weight_path = next((p for p in BILSTM_WEIGHT_CANDIDATES if p.exists()), None)
+        if weight_path is None:
+            print(f"[경고] BiLSTM 가중치 없음. 확인 경로: {BILSTM_WEIGHT_CANDIDATES}")
+            return None, None
+        model = DrowsinessBiLSTM(input_size=4, hidden_size=64, num_layers=2, num_classes=3)
     else:
         weight_path = ROOT / "models" / "best_lstm_model.pth"
+        if not weight_path.exists():
+            print(f"[경고] LSTM 가중치 없음: {weight_path}")
+            return None, None
         model = DrowsyLSTM(input_dim=4, hidden_dim=64, num_layers=2, num_classes=3)
-
-    if not weight_path.exists():
-        print(f"[경고] 가중치 없음: {weight_path}")
-        return None, None
 
     try:
         model.load_state_dict(torch.load(weight_path, map_location=device))
         model.to(device).eval()
+        print(f"[정보] {model_type.upper()} 가중치 로드 완료 ({weight_path.name})")
         return model, device
     except Exception as e:
         print(f"[경고] 모델 로드 실패: {e}")
@@ -363,14 +439,25 @@ def load_feature_extractor():
     return FeatureExtractor()
 
 
-def predict_with_lstm(model, device, frame_window: deque) -> tuple:
+def predict_with_lstm(model, device, frame_window: deque, scaler=None) -> tuple:
     """
-    30프레임 시퀀스를 LSTM에 넣어 졸음 점수와 클래스 예측.
+    30프레임 시퀀스를 LSTM/BiLSTM에 넣어 졸음 점수와 클래스 예측.
 
+    Args:
+        model:         학습된 LSTM 또는 BiLSTM 모델
+        device:        torch device
+        frame_window:  최근 30프레임의 (ear,pitch,yaw,roll) deque
+        scaler:        BiLSTM 사용 시 학습 때 fit한 StandardScaler
+                       (LSTM은 정규화 없이 학습됐으므로 None)
     Returns:
         (score 0~100, pred_class 0/1/2, probs np.array)
     """
     arr = np.array(list(frame_window), dtype=np.float32)   # (30, 4)
+
+    # BiLSTM 경로: 학습 시와 동일하게 표준화
+    if scaler is not None:
+        arr = scaler.transform(arr).astype(np.float32)
+
     tensor = torch.from_numpy(arr).unsqueeze(0).to(device) # (1, 30, 4)
 
     with torch.no_grad():
@@ -428,6 +515,13 @@ init_state()
 # 모델/추출기 로드 (캐시되어 한 번만 실행됨)
 lstm_model, lstm_device = load_lstm_model(st.session_state["model_type"])
 feature_extractor       = load_feature_extractor()
+
+# BiLSTM 사용 시에만 스케일러 fit (LSTM은 정규화 없이 학습됐으므로 불필요)
+if st.session_state["model_type"] == "bilstm" and BILSTM_AVAILABLE:
+    bilstm_scaler = load_bilstm_scaler()
+else:
+    bilstm_scaler = None
+
 LSTM_READY = lstm_model is not None and feature_extractor is not None
 
 # ── Helpers ───────────────────────────────────────────────────────────────────────
@@ -916,7 +1010,8 @@ if st.session_state["running"]:
 
         if LSTM_READY and len(st.session_state["feature_window"]) == WINDOW_SIZE:
             raw_score, pred_class, probs = predict_with_lstm(
-                lstm_model, lstm_device, st.session_state["feature_window"]
+                lstm_model, lstm_device, st.session_state["feature_window"],
+                scaler=bilstm_scaler,  # BiLSTM에서만 사용 (LSTM은 None)
             )
             used_lstm = True
             st.session_state["last_pred_class"] = pred_class
